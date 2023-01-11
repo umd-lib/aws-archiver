@@ -10,20 +10,31 @@ from boto3.exceptions import S3UploadFailedError
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError, ProfileNotFound
 
+from enum import Enum, unique
+
 from .asset import Asset
 from .exceptions import ConfigException, PathOutOfScopeException, FailureException
+from .utils import calculate_relative_path
 
 
-def get_s3_client(profile_name):
+def get_s3_client(profile_name, dry_run=False):
     """
     Set up a session with specified authentication profile.
     """
-    try:
-        session = boto3.session.Session(profile_name=profile_name)
-    except ProfileNotFound as e:
-        print(e, file=sys.stderr)
-        raise FailureException from e
-    return session.resource('s3').meta.client
+    if dry_run:
+        from unittest.mock import MagicMock
+        mock_s3_client = MagicMock()
+        response = {'ResponseMetadata': {'HTTPHeaders': {'etag': 'DRY_RUN'}}}
+        mock_s3_client.head_object = MagicMock(return_value=response)
+
+        return mock_s3_client
+    else:
+        try:
+            session = boto3.session.Session(profile_name=profile_name)
+        except ProfileNotFound as e:
+            print(e, file=sys.stderr)
+            raise FailureException from e
+        return session.resource('s3').meta.client
 
 
 class ProgressPercentage:
@@ -66,27 +77,42 @@ DEFAULT_LOG_DIR = 'logs'
 DEFAULT_MANIFEST_FILENAME = 'manifest.txt'
 
 
+@unique
+class ManifestFileType(Enum):
+    """
+    Enumeration of manifest file types
+    """
+    MD5_SUM = 1
+    PATSY_DB = 2
+
+
 class Batch:
     """
     Class representing a set of resources to be archived,
     and an AWS configuration where they will be archived.
     """
-
     def __init__(self, path, bucket, asset_root, name=None, log_dir=None, flatten=False):
         """
         Set up a batch of assets to be loaded. Any assets whose local paths don't exist are omitted from the batch.
         """
-        self.path = path
-        if name is not None:
-            self.name = name
-        else:
-            self.name = os.path.basename(self.path)
-        self.bucket = bucket
-        self.asset_root = os.path.abspath(asset_root)
-        if not self.asset_root.endswith('/'):
-            self.asset_root += '/'
+        self.manifest = manifest
+        self.name = manifest.batch_name
+        if self.name is None:
+            if name is not None:
+                self.name = name
+            else:
+                self.name = manifest.manifest_path
 
-        self.log_dir = os.path.join(self.path, log_dir if log_dir is not None else DEFAULT_LOG_DIR)
+        self.bucket = bucket
+
+        if asset_root is None:
+            self.asset_root = None
+        else:
+            self.asset_root = os.path.abspath(asset_root)
+            if not self.asset_root.endswith('/'):
+                self.asset_root += '/'
+
+        self.log_dir = os.path.join(manifest.manifest_path, log_dir if log_dir is not None else DEFAULT_LOG_DIR)
         if not os.path.isdir(self.log_dir):
             os.mkdir(self.log_dir)
 
@@ -144,10 +170,13 @@ class Batch:
                         all_filenames.add(filename)
         return False
 
-    def add_asset(self, path, md5=None):
+    def add_asset(self, path, md5=None, relpath=None, manifest_row=None):
         try:
             self.stats['total_assets'] += 1
-            asset = Asset(path, self.asset_root, md5)
+            if (self.asset_root is not None) and (relpath is None):
+                relpath = calculate_relative_path(self.asset_root, path)
+
+            asset = Asset(path, md5, relpath=relpath, manifest_row=manifest_row)
             self.contents.append(asset)
             self.stats['assets_found'] += 1
         except FileNotFoundError as e:
@@ -157,8 +186,8 @@ class Batch:
             self.stats['assets_ignored'] += 1
             print(f'Skipping {path}: {e}', file=sys.stderr)
 
-    def deposit(self, profile_name, chunk_size=None, storage_class=None, max_threads=None):
-        s3_client = get_s3_client(profile_name)
+    def deposit(self, profile_name, chunk_size=None, storage_class=None, max_threads=None, dry_run=False):
+        s3_client = get_s3_client(profile_name, dry_run)
 
         if chunk_size is None:
             chunk_size = DEFAULT_CHUNK_SIZE
@@ -185,16 +214,24 @@ class Batch:
             f'  - Use Threads: {use_threads}\n'
             f'  - Max Threads: {max_threads}\n'
             f'  - AWS Profile: {profile_name}\n'
-            f'  - Flatten: {self.flatten}\n\n'
+            f'  - Flatten: {self.flatten}\n'
+            f'  - Dry Run: {dry_run}\n\n'
         )
 
         begin = datetime.now()
         self.stats['deposit_begin'] = begin.isoformat()
 
-        if self.manifest_filename:
+        if self.manifest.manifest_filename:
             results_file_exists = os.path.exists(self.results_filename)
             results_file = open(self.results_filename, 'a')
-            fieldnames = ['id', 'local_path', 'filename', 'md5', 'bytes', 'keypath', 'etag', 'result']
+            fieldnames = ['id']
+            # Include fields from the manifest in the results file
+            if (len(self.contents) > 0):
+                first_asset = self.contents[0]
+                manifest_row = first_asset.manifest_row
+                if manifest_row:
+                    fieldnames.extend(manifest_row.keys())
+            fieldnames.extend(['keypath', 'etag', 'result', 'storageprovider', 'storagepath'])
             writer = csv.DictWriter(results_file, fieldnames=fieldnames)
             if not results_file_exists:
                 writer.writeheader()
@@ -273,6 +310,10 @@ class Batch:
                 remote_etag = headers['etag'].replace('"', '')
                 sys.stdout.write(f'    -> Local:  {expected_etag}\n')
                 sys.stdout.write(f'    -> Remote: {remote_etag}\n\n')
+
+                if dry_run:
+                    expected_etag = remote_etag
+
                 if remote_etag == expected_etag:
                     self.stats['successful_deposits'] += 1
                     sys.stdout.write(f'  ETag match! Transfer success!\n')
@@ -284,14 +325,15 @@ class Batch:
 
                 row = {
                     'id': n,
-                    'local_path': asset.local_path,
-                    'filename': asset.filename,
-                    'md5': asset.md5,
-                    'bytes': asset.bytes,
                     'keypath': key_path,
                     'etag': remote_etag,
-                    'result': result
+                    'result': result,
+                    'storageprovider': 'AWS',
+                    'storagepath': f'{self.bucket}/{key_path}'
                 }
+                if asset.manifest_row:
+                    row.update(asset.manifest_row)
+
                 if writer is not None:
                     writer.writerow(row)
 
